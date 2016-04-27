@@ -16,26 +16,23 @@
 package org.cyanogenmod.audiofx;
 
 import android.app.Service;
-import android.content.BroadcastReceiver;
-import android.content.Context;
-import android.content.Intent;
-import android.content.IntentFilter;
-import android.content.SharedPreferences;
+import android.bluetooth.BluetoothA2dp;
+import android.content.*;
 import android.media.AudioManager;
 import android.media.AudioPatch;
 import android.media.AudioPort;
-import android.media.AudioSystem;
-import android.media.audiofx.AudioEffect;
-import android.media.audiofx.BassBoost;
-import android.media.audiofx.Equalizer;
-import android.media.audiofx.PresetReverb;
-import android.media.audiofx.Virtualizer;
+import android.media.audiofx.*;
+import android.net.NetworkInfo;
+import android.net.wifi.p2p.WifiP2pManager;
 import android.os.Binder;
 import android.os.IBinder;
 import android.util.Log;
-import android.util.SparseArray;
 
 import java.util.Arrays;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * <p>This calls listen to events that affect DSP function and responds to them.</p>
@@ -193,64 +190,6 @@ public class HeadsetService extends Service {
     protected static final String TAG = HeadsetService.class.getSimpleName();
     public static final boolean DEBUG = Log.isLoggable(TAG, Log.DEBUG);
 
-    private FxSessionCallback mSessionCallback;
-
-    private void addSession(int sessionId) {
-        if (sessionId == 0) {
-            return;
-        }
-        if (DEBUG) Log.i(TAG, String.format("New audio session: %d", sessionId));
-
-        synchronized (mAudioSessionsL) {
-            if (mAudioSessionsL.indexOfKey(sessionId) < 0) {
-                mAudioSessionsL.put(sessionId, new EffectSet(sessionId));
-            }
-            updateLocked();
-        }
-    }
-
-    private void removeSession(int sessionId) {
-        if (sessionId == 0) {
-            return;
-        }
-        if (DEBUG) Log.i(TAG, String.format("Audio session removed: %d", sessionId));
-
-        synchronized (mAudioSessionsL) {
-            EffectSet gone = mAudioSessionsL.removeReturnOld(sessionId);
-            if (gone != null) {
-                gone.release();
-            }
-        }
-    }
-
-    private class FxSessionCallback implements AudioSystem.EffectSessionCallback {
-
-        @Override
-        public void onSessionAdded(int stream, int sessionId, int flags,
-                int channelMask, int uid) {
-            if (stream == AudioManager.STREAM_MUSIC &&
-                    (flags < 0 || (flags & 0x8) > 0 || (flags & 0x10) > 0) &&
-                    (channelMask < 0 || channelMask > 1)) {
-
-                // Never auto-attach is someone is recording! We don't want to interfere with any sort of
-                // loopback mechanisms.
-                final boolean recording = AudioSystem.isSourceActive(0) || AudioSystem.isSourceActive(6);
-                if (recording) {
-                    Log.w(TAG, "Recording in progress, not performing auto-attach!");
-                    return;
-                }
-                addSession(sessionId);
-            }
-        }
-
-        @Override
-        public void onSessionRemoved(int stream, int sessionId) {
-            if (stream == AudioManager.STREAM_MUSIC) {
-                removeSession(sessionId);
-            }
-        }
-    }
-
     public class LocalBinder extends Binder {
         public HeadsetService getService() {
             return HeadsetService.this;
@@ -262,7 +201,7 @@ public class HeadsetService extends Service {
     /**
      * Known audio sessions and their associated audioeffect suites.
      */
-    private final SparseArray<EffectSet> mAudioSessionsL = new SparseArray<EffectSet>();
+    protected final ConcurrentHashMap<Integer, EffectSet> mAudioSessions = new ConcurrentHashMap<Integer, EffectSet>();
 
     AudioPortListener mAudioPortListener;
 
@@ -280,11 +219,19 @@ public class HeadsetService extends Service {
             String action = intent.getAction();
             int sessionId = intent.getIntExtra(AudioEffect.EXTRA_AUDIO_SESSION, 0);
             if (action.equals(AudioEffect.ACTION_OPEN_AUDIO_EFFECT_CONTROL_SESSION)) {
-                addSession(sessionId);
+                Log.i(TAG, String.format("New audio session: %d", sessionId));
+                if (!mAudioSessions.containsKey(sessionId)) {
+                    mAudioSessions.put(sessionId, new EffectSet(sessionId));
+                }
             }
             if (action.equals(AudioEffect.ACTION_CLOSE_AUDIO_EFFECT_CONTROL_SESSION)) {
-                removeSession(sessionId);
+                Log.i(TAG, String.format("Audio session removed: %d", sessionId));
+                EffectSet gone = mAudioSessions.remove(sessionId);
+                if (gone != null) {
+                    gone.release();
+                }
             }
+            update();
         }
     };
 
@@ -411,9 +358,6 @@ public class HeadsetService extends Service {
         AudioManager am = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
         am.registerAudioPortUpdateListener(mAudioPortListener = new AudioPortListener(this));
 
-        mSessionCallback = new FxSessionCallback();
-        AudioSystem.setEffectSessionCallback(mSessionCallback);
-
         saveDefaults();
     }
 
@@ -429,7 +373,6 @@ public class HeadsetService extends Service {
 
         unregisterReceiver(mAudioSessionReceiver);
         unregisterReceiver(mPreferenceUpdateReceiver);
-        AudioSystem.setEffectSessionCallback(null);
     }
 
     @Override
@@ -482,9 +425,7 @@ public class HeadsetService extends Service {
     }
 
     public EffectSet getEffects(int session) {
-        synchronized (mAudioSessionsL) {
-            return mAudioSessionsL.get(session);
-        }
+        return mAudioSessions.get(session);
     }
 
     private void saveDefaults() {
@@ -580,21 +521,15 @@ public class HeadsetService extends Service {
     /**
      * Push new configuration to audio stack.
      */
-    void update() {
-        synchronized (mAudioSessionsL) {
-            updateLocked();
-        }
-    }
-
-    private void updateLocked() {
+    protected synchronized void update() {
         final String mode = getAudioOutputRouting();
         SharedPreferences preferences = getSharedPreferences(
                 mode, 0);
 
         if (DEBUG) Log.i(TAG, "Selected configuration: " + mode);
 
-        for (int i = 0; i < mAudioSessionsL.size(); i++) {
-            updateDsp(preferences, mAudioSessionsL.valueAt(i));
+        for (Integer sessionId : mAudioSessions.keySet()) {
+            updateDsp(preferences, mAudioSessions.get(sessionId));
         }
     }
 
